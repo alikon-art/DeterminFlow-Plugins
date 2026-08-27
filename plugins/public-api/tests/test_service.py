@@ -153,6 +153,7 @@ def build_service(
     browser_auth: Any = None,
     client_config: dict[str, Any] | None = None,
     announcements: list[dict[str, Any]] | None = None,
+    scheduler_interval_seconds: float = 0.01,
 ) -> tuple[PublicApiCredentialService, FakeProviderGateway]:
     providers = FakeProviderGateway()
     default_client_config = {
@@ -219,7 +220,7 @@ def build_service(
         ),
         providers=providers,
         clock=clock,
-        scheduler_interval_seconds=0.01,
+        scheduler_interval_seconds=scheduler_interval_seconds,
         browser_auth=browser_auth,
     )
     return service, providers

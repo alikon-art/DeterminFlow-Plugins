@@ -123,11 +123,7 @@ class PublicApiCredentialService:
             raise
 
     async def start(self) -> None:
-        await self.refresh_client_config(force=True)
-        if (self._runtime_ui is None or self._runtime_ui.service_enabled) and (
-            self._credential() is not None or self._session() is not None
-        ):
-            await self.ensure_credential(force=True)
+        await self._bootstrap_runtime(force=True, renew_credential=True)
         if self.portal is not None and self._scheduler_task is None:
             self._scheduler_task = asyncio.create_task(
                 self._scheduler_loop(),
@@ -220,41 +216,83 @@ class PublicApiCredentialService:
         return response
 
     async def refresh_client_config(self, *, force: bool = False) -> PublicApiStatus:
+        await self._bootstrap_runtime(force=force, renew_credential=False)
+        return self.status()
+
+    async def _bootstrap_runtime(
+        self,
+        *,
+        force: bool,
+        renew_credential: bool,
+    ) -> None:
         if self.portal is None:
-            return self.status()
+            return
         now = self._clock()
         if (
             not force
             and self._runtime_ui_fetched_at is not None
             and now - self._runtime_ui_fetched_at < timedelta(seconds=60)
         ):
-            return self.status()
-        runtime_ui: PublicApiClientUI | None = None
+            return
+
+        ui_task = asyncio.create_task(self._fetch_runtime_ui())
+        announcements_task = asyncio.create_task(self._refresh_announcements())
+        try:
+            fetched_ui = await ui_task
+        except BaseException:
+            announcements_task.cancel()
+            await asyncio.gather(announcements_task, return_exceptions=True)
+            raise
+
+        if fetched_ui is not None:
+            self._runtime_ui = fetched_ui
+            self._runtime_ui_fetched_at = now
+
+        follow_ups: list[asyncio.Task[Any]] = [announcements_task]
+        if fetched_ui is not None and not fetched_ui.service_enabled:
+            follow_ups.append(asyncio.create_task(self._clear_managed_credential()))
+        elif (
+            renew_credential
+            and (self._runtime_ui is None or self._runtime_ui.service_enabled)
+            and (self._credential() is not None or self._session() is not None)
+        ):
+            follow_ups.append(asyncio.create_task(self.ensure_credential(force=True)))
+        results = await asyncio.gather(*follow_ups, return_exceptions=True)
+        errors = [item for item in results if isinstance(item, BaseException)]
+        for error in errors:
+            if not isinstance(error, Exception):
+                raise error
+        if errors:
+            raise errors[0]
+
+    async def _fetch_runtime_ui(self) -> PublicApiClientUI | None:
+        assert self.portal is not None
         try:
             body = await self.portal.client_config()
-            runtime_ui = PublicApiClientUI.model_validate(body)
+            return PublicApiClientUI.model_validate(body)
         except (PortalRequestError, TypeError, ValueError):
-            pass
-        else:
-            self._runtime_ui = runtime_ui
-            self._runtime_ui_fetched_at = now
+            return None
+
+    async def _refresh_announcements(self) -> None:
+        assert self.portal is not None
         try:
             announcements = await self.portal.announcements()
             self._runtime_announcements = [
                 PublicApiAnnouncement.model_validate(item) for item in announcements
             ]
         except (PortalRequestError, TypeError, ValueError):
-            pass
-        if runtime_ui is not None and not runtime_ui.service_enabled:
-            credential = self._credential()
-            if credential:
-                try:
-                    await self._remove_managed_provider(credential)
-                except ProviderRequestError:
-                    logger.warning("关闭公益模型服务时无法移除托管 Provider")
-                self.state["credential"] = None
-                self._save_state()
-        return self.status()
+            return
+
+    async def _clear_managed_credential(self) -> None:
+        credential = self._credential()
+        if not credential:
+            return
+        try:
+            await self._remove_managed_provider(credential)
+        except ProviderRequestError:
+            logger.warning("关闭公益模型服务时无法移除托管 Provider")
+        self.state["credential"] = None
+        self._save_state()
 
     async def ensure_credential(self, *, force: bool = False) -> PublicApiStatus:
         async with self._lock:
