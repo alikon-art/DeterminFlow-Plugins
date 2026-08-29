@@ -56,3 +56,54 @@ jobs:
           DETERMINFLOW_CORE_ROOT: ${{ github.workspace }}/determinflow
           PYTHONPATH: ${{ github.workspace }}/determinflow:${{ github.workspace }}/plugins/public-api
         run: python -m pytest -q plugins/public-api/tests
+
+  publish-registry:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.R2_DISTRIBUTION_ENABLED == 'true'
+    needs:
+      - bishu-novel
+      - public-api
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/DeterminFlow
+          path: determinflow
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: determinflow/requirements.lock
+      - run: python -m pip install -r determinflow/requirements.lock
+      - name: Build signed registry
+        working-directory: determinflow
+        env:
+          PLUGIN_REGISTRY_SIGNING_KEY: ${{ secrets.PLUGIN_REGISTRY_SIGNING_KEY }}
+        run: >-
+          python -m src.plugin_system.registry_release build
+          --repository "$GITHUB_WORKSPACE"
+          --source-url "https://github.com/alikon-art/DeterminFlow-Plugins.git"
+          --ref "$GITHUB_SHA"
+          --output "$GITHUB_WORKSPACE/registry-output"
+          --public-base-url "https://downloads.determinflow.com/plugins/v1"
+      - name: Publish verified registry to R2
+        working-directory: determinflow
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT_URL: ${{ vars.R2_ENDPOINT_URL }}
+        run: |
+          aws --version
+          python -m src.plugin_system.registry_release publish \
+            --registry-dir "$GITHUB_WORKSPACE/registry-output" \
+            --prefix "plugins/v1" \
+            --bucket "$R2_BUCKET" \
+            --endpoint-url "$R2_ENDPOINT_URL" \
+            --public-base-url "https://downloads.determinflow.com"

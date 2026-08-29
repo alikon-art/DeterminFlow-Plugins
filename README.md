@@ -13,7 +13,11 @@ Plugin 可以扩展 Workflow、Agent、Prompt、Script Library（脚本库）和
 
 ## 安装
 
-在 DeterminFlow 的 Plugin 页面填写：
+DeterminFlow 的内置官方来源优先从签名的 R2 Registry（注册表）读取 Catalog 和安装包，
+并校验 Registry 签名、Plugin 内容摘要与精确 Git Commit。R2 不可用或校验失败时会自动
+回退到 GitHub/Gitee Git 源；自定义第三方来源仍使用 Git。
+
+手动添加本仓库时，在 DeterminFlow 的 Plugin 页面填写：
 
 - Git URL：`https://github.com/alikon-art/DeterminFlow-Plugins.git`
 - Ref：精确 Commit 或 Release Tag
