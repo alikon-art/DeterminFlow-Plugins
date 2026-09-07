@@ -25,7 +25,7 @@ def test_manifest_catalog_and_static_page_define_one_optional_plugin() -> None:
 
     assert extension["id"] == "public-api"
     assert extension["name"] == "笔枢公益模型"
-    assert extension["version"] == "0.1.35"
+    assert extension["version"] == "0.1.36"
     assert extension["description"] == "由笔枢写作免费提供的模型体验服务。"
     assert extension["backend"].startswith("determinflow_plugin_public_api.")
     assert "settings" not in manifest
@@ -57,7 +57,7 @@ def test_plugin_source_does_not_import_core_model_manager_or_desktop_code() -> N
     assert "desktop.python" not in sources
 
 
-def test_extension_is_inert_outside_windows_desktop(
+def test_extension_is_inert_outside_supported_desktop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -69,7 +69,7 @@ def test_extension_is_inert_outside_windows_desktop(
         manifest = ExtensionManifest(
             extension_id="public-api",
             name="笔枢公益模型",
-            version="0.1.35",
+            version="0.1.36",
         )
         contributions = ExtensionContributions()
         extension.register(ExtensionRegistrar(manifest, contributions))
@@ -94,8 +94,9 @@ def test_extension_is_inert_outside_windows_desktop(
             assert extension.service is not None
             status = extension.service.status()
             assert status.state == "disabled"
-            assert status.last_error == "仅支持 Windows 桌面版"
-            assert status.header_status is None
+            assert status.last_error == "仅支持 Windows 和 macOS 桌面版"
+            assert status.header_status is not None
+            assert status.header_status.summary == status.last_error
             assert extension.service.account_session is account_session
         finally:
             await extension.stop()
@@ -192,3 +193,18 @@ def test_older_core_keeps_legacy_session_without_migrating_credentials(tmp_path,
             await extension.stop()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin"])
+def test_public_api_supports_release_desktops(monkeypatch, platform):
+    monkeypatch.setenv("DETERMINFLOW_DESKTOP", "1")
+    monkeypatch.delenv("DETERMINFLOW_PUBLIC_API_DEVELOPMENT", raising=False)
+    monkeypatch.setattr(extension_module.sys, "platform", platform)
+    assert extension_module._runtime_access() == (True, "stable", None)
+
+
+def test_linux_desktop_is_not_silently_enabled(monkeypatch):
+    monkeypatch.setenv("DETERMINFLOW_DESKTOP", "1")
+    monkeypatch.delenv("DETERMINFLOW_PUBLIC_API_DEVELOPMENT", raising=False)
+    monkeypatch.setattr(extension_module.sys, "platform", "linux")
+    assert extension_module._runtime_access()[0] is False

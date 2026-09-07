@@ -51,6 +51,7 @@ class LegacyCredentialService:
         *,
         app_version: str,
         release_channel: str = "stable",
+        platform_name: str = "windows",
         portal: PublicApiPortalClient | None,
         catalog: PublicModelCatalogClient,
         providers: ProviderGateway,
@@ -62,6 +63,7 @@ class LegacyCredentialService:
         self.data_dir = data_dir.expanduser().resolve()
         self.app_version = app_version.strip() or "unknown"
         self.release_channel = release_channel.strip() or "stable"
+        self.platform_name = platform_name
         self.portal = portal
         self.catalog = catalog
         self.providers = providers
@@ -468,7 +470,7 @@ class LegacyCredentialService:
             "installation_id": self.state["installation_id"],
             "app_version": self.app_version,
             "release_channel": self.release_channel,
-            "platform": "windows",
+            "platform": self.platform_name,
         }
         if credential_id:
             payload["credential_id"] = credential_id
@@ -605,7 +607,7 @@ class LegacyCredentialService:
         header = self._legacy_header_status(status)
         if header is not None:
             return header
-        if status.state == "unavailable" and not status.login_pending:
+        if status.state in {"unavailable", "disabled"} and not status.login_pending:
             header = CurrentCredentialService._header_status(self, status)
             if header and status.ui.login_enabled:
                 header.actions.append(HeaderStatusAction(

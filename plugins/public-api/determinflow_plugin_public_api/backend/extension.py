@@ -23,21 +23,21 @@ _DEVELOPMENT_OVERRIDE_ENV = "DETERMINFLOW_PUBLIC_API_DEVELOPMENT"
 
 
 def _runtime_access() -> tuple[bool, str, str | None]:
-    windows_desktop = (
-        os.getenv("DETERMINFLOW_DESKTOP") == "1" and sys.platform == "win32"
+    supported_desktop = (
+        os.getenv("DETERMINFLOW_DESKTOP") == "1" and sys.platform in {"win32", "darwin"}
     )
-    if windows_desktop:
+    if supported_desktop:
         return True, "stable", None
     if os.getenv(_DEVELOPMENT_OVERRIDE_ENV) == "1":
         return True, "development", None
-    return False, "stable", "仅支持 Windows 桌面版"
+    return False, "stable", "仅支持 Windows 和 macOS 桌面版"
 
 
 class PublicApiExtension:
     manifest = ExtensionManifest(
         extension_id="public-api",
         name="笔枢公益模型",
-        version="0.1.35",
+        version="0.1.36",
     )
 
     def __init__(self) -> None:
@@ -87,6 +87,7 @@ class PublicApiExtension:
             data_dir,
             app_version=self.manifest.version,
             release_channel=release_channel,
+            platform_name="macos" if sys.platform == "darwin" else "windows",
             portal=portal,
             catalog=PublicModelCatalogClient(
                 app_version=self.manifest.version,
