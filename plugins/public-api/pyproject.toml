@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "determinflow-plugin-public-api"
-version = "0.1.36"
+version = "0.1.37"
 description = "Optional public model credential plugin for DeterminFlow"
 readme = "README.md"
 requires-python = ">=3.11"
