@@ -228,12 +228,17 @@ class PublicApiCredentialService:
 
     async def refresh_client_config(self, *, force: bool = False) -> PublicApiStatus:
         await self._bootstrap_runtime(force=force, renew_credential=False)
-        credential = self._credential()
-        if credential is not None and bool(credential.get("authenticated")) != (
-            self._account_signed_in()
-        ):
-            return await self.ensure_credential(force=True)
-        return self.status()
+        # Core login can finish before the Plugin has ever issued a credential.
+        # Recheck under the lock: concurrent status refreshes must provision once.
+        async with self._lock:
+            credential = self._credential()
+            signed_in = self._account_signed_in()
+            if (credential is None and signed_in) or (
+                credential is not None
+                and bool(credential.get("authenticated")) != signed_in
+            ):
+                return await self._ensure_locked(force=True)
+            return self.status()
 
     async def _bootstrap_runtime(
         self,
