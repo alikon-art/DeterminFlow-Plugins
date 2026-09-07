@@ -161,6 +161,7 @@ def build_service(
     *,
     clock: Any,
     release_channel: str = "stable",
+    platform_name: str = "windows",
     browser_auth: Any = None,
     client_config: dict[str, Any] | None = None,
     announcements: list[dict[str, Any]] | None = None,
@@ -224,6 +225,7 @@ def build_service(
         tmp_path,
         app_version="0.1.0",
         release_channel=release_channel,
+        platform_name=platform_name,
         portal=portal,
         catalog=PublicModelCatalogClient(
             app_version="0.1.0",
@@ -317,8 +319,9 @@ def test_status_exposes_dedicated_public_model_announcements(tmp_path: Path) -> 
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("platform_name", ["windows", "macos"])
 def test_anonymous_credential_becomes_default_without_duplicate_key_storage(
-    tmp_path: Path,
+    tmp_path: Path, platform_name: str,
 ) -> None:
     async def scenario() -> None:
         now = datetime(2026, 8, 8, 8, tzinfo=UTC)
@@ -329,7 +332,7 @@ def test_anonymous_credential_becomes_default_without_duplicate_key_storage(
             requests.append(json.loads(request.content))
             return httpx.Response(200, json=credential_response(now))
 
-        service, providers = build_service(tmp_path, handler, clock=lambda: now)
+        service, providers = build_service(tmp_path, handler, clock=lambda: now, platform_name=platform_name)
         status = await service.ensure_credential()
 
         assert status.state == "active"
@@ -367,7 +370,7 @@ def test_anonymous_credential_becomes_default_without_duplicate_key_storage(
         assert status.renewal_due_at == now + timedelta(hours=18)
         assert next(iter(providers.providers)) == "determinflow-public"
         assert providers.providers["determinflow-public"]["api_key"] == "public-key-1"
-        assert requests[0]["platform"] == "windows"
+        assert requests[0]["platform"] == platform_name
         assert requests[0]["app_version"] == "0.1.0"
         assert requests[0]["release_channel"] == "stable"
         assert "credential_id" not in requests[0]

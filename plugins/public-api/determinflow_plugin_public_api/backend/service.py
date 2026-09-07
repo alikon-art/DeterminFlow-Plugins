@@ -57,6 +57,7 @@ class PublicApiCredentialService:
         *,
         app_version: str,
         release_channel: str = "stable",
+        platform_name: str = "windows",
         portal: PublicApiPortalClient | None,
         catalog: PublicModelCatalogClient,
         providers: ProviderGateway,
@@ -68,6 +69,7 @@ class PublicApiCredentialService:
         self.data_dir = data_dir.expanduser().resolve()
         self.app_version = app_version.strip() or "unknown"
         self.release_channel = release_channel.strip() or "stable"
+        self.platform_name = platform_name
         self.portal = portal
         self.catalog = catalog
         self.providers = providers
@@ -410,7 +412,7 @@ class PublicApiCredentialService:
             "installation_id": self._installation_id(),
             "app_version": self.app_version,
             "release_channel": self.release_channel,
-            "platform": "windows",
+            "platform": self.platform_name,
         }
         if credential_id:
             payload["credential_id"] = credential_id
@@ -539,6 +541,25 @@ class PublicApiCredentialService:
         }
 
     def _header_status(self, status: PublicApiStatus) -> HeaderStatus | None:
+        if status.state == "disabled":
+            return HeaderStatus(
+                visible=True, label="公益", value="不可用",
+                title="公益模型暂不可用",
+                summary=status.last_error or "公益模型服务暂未开放，请稍后重试。",
+                tone="attention", metrics=[], metadata=[],
+                actions=[HeaderStatusAction(id="models", label="模型列表", kind="page")],
+                updated_at=self._clock(),
+            )
+        if status.state in {"active", "degraded"} and status.quota is None:
+            return HeaderStatus(
+                visible=True, label="公益", value="额度未知",
+                title="公益模型额度暂不可用",
+                summary=status.last_error or "暂未获取到额度，请刷新后重试。",
+                tone="attention", metrics=[], metadata=[],
+                actions=[HeaderStatusAction(id="retry", label="重试", kind="request",
+                    endpoint="/api/public-api/renew", method="POST")],
+                updated_at=self._clock(),
+            )
         if status.state == "unavailable":
             now = self._clock()
             actions: list[HeaderStatusAction] = [

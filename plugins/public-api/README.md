@@ -1,6 +1,6 @@
 # 笔枢公益模型 Plugin
 
-这是一个可选 Plugin，为 Windows 桌面版申请、保存和续签普通
+这是一个可选 Plugin，为 Windows 和 macOS 桌面版申请、保存和续签普通
 `base_url + api_key` Provider。未安装或未启用时，DeterminFlow Core 不加载任何公益模型逻辑。
 
 ## 边界
@@ -24,7 +24,7 @@
   申请失败时保留浮窗并提供重试。“模型列表”在右侧半屏打开 Plugin 页面，不占用插件详情抽屉。
 - 公益充值由笔枢门户承接，Plugin 只打开门户 URL。浮窗与模型列表页的充值入口由
   Portal 两个独立开关控制，支付网关地址和鉴权信息不会进入 Plugin。
-- 当前 Portal 只接受 Windows 客户端；其他运行环境会保持禁用状态。
+- 支持 Windows 和 macOS 桌面客户端；凭据请求如实标记平台。需要 Portal 接受 macos 平台的接口版本。
 
 ## 安装
 
@@ -35,7 +35,7 @@
 
 ## 本地开发
 
-非 Windows 环境只允许通过显式开发开关调试：
+非桌面运行环境只允许通过显式开发开关调试：
 
 ```bash
 DETERMINFLOW_PUBLIC_API_DEVELOPMENT=1 .venv/bin/uvicorn src.web_server:app \
