@@ -27,17 +27,14 @@ def build_router(
     @router.post("/login", response_model=PublicApiStatus)
     async def login() -> PublicApiStatus:
         try:
-            return await get_service().start_login()
+            return await get_service().login_account()
         except PortalRequestError as exc:
             raise HTTPException(status_code=503, detail=exc.message) from exc
 
     @router.delete("/login", response_model=PublicApiStatus)
     async def logout() -> PublicApiStatus:
         try:
-            service = get_service()
-            if service.status().login_pending:
-                return await service.cancel_login()
-            return await service.logout()
+            return await get_service().logout_account()
         except PortalRequestError as exc:
             raise HTTPException(status_code=503, detail=exc.message) from exc
 

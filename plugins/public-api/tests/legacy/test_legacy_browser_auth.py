@@ -10,9 +10,9 @@ import httpx
 import pytest
 
 from determinflow_plugin_public_api.backend.browser_auth import BrowserAuthorizationFlow
-from determinflow_plugin_public_api.backend.portal import (
+from determinflow_plugin_public_api.backend.legacy_portal import (
     PortalRequestError,
-    PublicApiPortalClient,
+    LegacyPortalClient as PublicApiPortalClient,
 )
 
 

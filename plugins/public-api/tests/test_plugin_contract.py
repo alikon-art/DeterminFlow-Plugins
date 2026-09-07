@@ -25,7 +25,7 @@ def test_manifest_catalog_and_static_page_define_one_optional_plugin() -> None:
 
     assert extension["id"] == "public-api"
     assert extension["name"] == "笔枢公益模型"
-    assert extension["version"] == "0.1.33"
+    assert extension["version"] == "0.1.35"
     assert extension["description"] == "由笔枢写作免费提供的模型体验服务。"
     assert extension["backend"].startswith("determinflow_plugin_public_api.")
     assert "settings" not in manifest
@@ -69,15 +69,20 @@ def test_extension_is_inert_outside_windows_desktop(
         manifest = ExtensionManifest(
             extension_id="public-api",
             name="笔枢公益模型",
-            version="0.1.33",
+            version="0.1.35",
         )
         contributions = ExtensionContributions()
         extension.register(ExtensionRegistrar(manifest, contributions))
         assert len(contributions.routers) == 1
 
+        account_session = SimpleNamespace(
+            installation_id="desktop:test",
+            access_token=lambda: None,
+        )
         services = {
             "plugin_config": {},
             "plugin_data_dir": tmp_path,
+            "account_session": account_session,
         }
         runtime = SimpleNamespace(
             app=FastAPI(),
@@ -90,6 +95,8 @@ def test_extension_is_inert_outside_windows_desktop(
             status = extension.service.status()
             assert status.state == "disabled"
             assert status.last_error == "仅支持 Windows 桌面版"
+            assert status.header_status is None
+            assert extension.service.account_session is account_session
         finally:
             await extension.stop()
 
@@ -106,13 +113,14 @@ def test_non_windows_development_override_is_explicit(
     assert extension_module._runtime_access() == (True, "development", None)
 
 
-def test_ui_uses_external_browser_login_without_collecting_credentials() -> None:
+def test_ui_leaves_account_login_to_core_without_collecting_credentials() -> None:
     script = (PLUGIN_ROOT / "ui" / "app.js").read_text(encoding="utf-8")
     page = (PLUGIN_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
 
     assert "console.log" not in script
     assert "/api/public-api" in script
-    assert 'request("/login", { method: "POST" })' in script
+    assert 'request("/login", { method: "POST" })' not in script
+    assert 'id="account"' not in page
     assert 'type="password"' not in page
     assert 'name="email"' not in page
     assert "model_page_recharge_enabled" in script
@@ -150,3 +158,37 @@ def test_ui_uses_external_browser_login_without_collecting_credentials() -> None
     assert 'id="error"' in page
     assert "accessLabel(status)" in script
     assert "status.quota?.remaining_usd" in script
+
+
+def test_older_core_keeps_legacy_session_without_migrating_credentials(tmp_path, monkeypatch):
+    import json
+    from determinflow_plugin_public_api.backend.legacy_service import LegacyCredentialService
+
+    monkeypatch.delenv("DETERMINFLOW_DESKTOP", raising=False)
+    monkeypatch.delenv("DETERMINFLOW_PUBLIC_API_DEVELOPMENT", raising=False)
+    state = {
+        "schema_version": 2,
+        "installation_id": "plugin:compatibility-test",
+        "portal_session": {"access_token": "test-access", "refresh_token": "test-refresh"},
+        "credential": None,
+    }
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    services = {"plugin_config": {}, "plugin_data_dir": tmp_path}
+    runtime = SimpleNamespace(
+        app=FastAPI(), resource_owner="public-api",
+        get_service=lambda name, default=None: services.get(name, default),
+    )
+
+    async def scenario():
+        extension = create_extension()
+        try:
+            await extension.start(runtime)
+            assert isinstance(extension.service, LegacyCredentialService)
+            assert extension.service.status().signed_in is True
+            saved = json.loads((tmp_path / "state.json").read_text())
+            assert saved["schema_version"] == 2
+            assert saved["portal_session"] == state["portal_session"]
+        finally:
+            await extension.stop()
+
+    asyncio.run(scenario())

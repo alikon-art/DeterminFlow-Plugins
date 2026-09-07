@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import httpx
-from determinflow_plugin_public_api.backend.portal import (
+from determinflow_plugin_public_api.backend.legacy_portal import (
     PortalRequestError,
-    PublicApiPortalClient,
+    LegacyPortalClient as PublicApiPortalClient,
 )
 
-from test_service import FakeBrowserAuthorization, build_service, credential_response
+from test_legacy_service import build_service, credential_response
 
 T = TypeVar("T")
 
@@ -128,22 +128,6 @@ def test_refresh_fetches_client_config_and_announcements_in_parallel(
         assert "issue" not in tracker.calls
         assert status.ui.service_enabled is True
         assert status.announcements[0].title == "并行公告"
-        assert status.state == "unavailable"
-        assert status.header_status is not None
-        assert status.header_status.value == "未启用"
-        assert status.header_status.title == "公益模型未启用"
-        assert status.header_status.summary == "启用后可查看并使用公益模型额度。"
-        assert status.header_status.tone == "attention"
-        assert [action.id for action in status.header_status.actions] == [
-            "enable",
-            "models",
-        ]
-        enable_action = status.header_status.actions[0]
-        assert enable_action.label == "启用公益模型"
-        assert enable_action.kind == "request"
-        assert enable_action.endpoint == "/api/public-api/renew"
-        assert enable_action.method == "POST"
-        assert status.header_status.actions[1].kind == "page"
 
     asyncio.run(scenario())
 
@@ -443,17 +427,17 @@ def test_start_renews_existing_session_without_credential(tmp_path: Path) -> Non
                 json=credential_response(now, access_tier="authenticated"),
             )
 
-        account_session = FakeBrowserAuthorization(
-            {"access_token": "access-saved", "refresh_token": "refresh-saved"}
-        )
-        await account_session.login()
         service, providers = build_service(
             tmp_path,
             handler,
             clock=lambda: now,
-            browser_auth=account_session,
             scheduler_interval_seconds=3600,
         )
+        service.state["portal_session"] = {
+            "access_token": "access-saved",
+            "refresh_token": "refresh-saved",
+        }
+        service._save_state()
 
         try:
             await service.start()
