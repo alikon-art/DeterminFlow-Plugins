@@ -3,6 +3,16 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: "Public Core tag or commit used to test and build the registry"
+        type: string
+        default: main
+      publish_registry:
+        description: "Publish verified packages and update the stable R2 registry (main only)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,6 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/DeterminFlow
+          ref: ${{ inputs.core_ref || 'main' }}
           path: determinflow
       - uses: actions/setup-python@v5
         with:
@@ -39,6 +50,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/DeterminFlow
+          ref: ${{ inputs.core_ref || 'main' }}
           path: determinflow
       - uses: actions/setup-python@v5
         with:
@@ -59,7 +71,8 @@ jobs:
 
   publish-registry:
     if: >-
-      github.event_name == 'push' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish_registry)) &&
       github.ref == 'refs/heads/main' &&
       vars.R2_DISTRIBUTION_ENABLED == 'true'
     needs:
@@ -73,6 +86,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/DeterminFlow
+          ref: ${{ inputs.core_ref || 'main' }}
           path: determinflow
       - uses: actions/setup-python@v5
         with:

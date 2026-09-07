@@ -13,6 +13,12 @@ Plugin 可以扩展 Workflow、Agent、Prompt、Script Library（脚本库）和
 
 ## 安装
 
+### 正式发版后的加速分发
+
+每次社区版正式发版，除 Core 仓库同步桌面安装包外，还必须运行本仓库 `CI` 的手动入口：选择公开 `main`，把 `core_ref` 固定为该次 Core Tag 或 Commit，勾选 `publish_registry`。该任务先测试两个官方插件，再构建并验证签名目录及包，最后更新 R2 稳定清单；失败时不得把插件分发标记为完成。
+
+默认手动运行只测试，不发布。发布仅允许在 `main` 且 `R2_DISTRIBUTION_ENABLED=true` 时执行；PR 不持有签名和上传凭据。正式发行还需核对公网 Manifest 的 Commit、签名、归档 SHA-256 与 Plugin 内容摘要。不可变历史对象不会覆盖，Full 旧安装包不跟随插件 `main` 改写。
+
 DeterminFlow 的内置官方来源优先从签名的 R2 Registry（注册表）读取 Catalog 和安装包，
 并校验 Registry 签名、Plugin 内容摘要与精确 Git Commit。R2 不可用或校验失败时会自动
 回退到 GitHub/Gitee Git 源；自定义第三方来源仍使用 Git。
