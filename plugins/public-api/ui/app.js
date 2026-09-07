@@ -12,7 +12,6 @@ const elements = {
   catalogBody: document.querySelector("#catalog-body"),
   error: document.querySelector("#error"),
   renew: document.querySelector("#renew"),
-  account: document.querySelector("#account"),
   payment: document.querySelector("#payment"),
   pageTitle: document.querySelector("#page-title"),
   officialLink: document.querySelector("#official-link"),
@@ -23,7 +22,6 @@ const elements = {
 
 let currentStatus = null;
 let busy = false;
-let polling = false;
 
 async function request(path, options = {}) {
   const response = await fetch(`/api/public-api${path}`, {
@@ -226,11 +224,9 @@ function render(status) {
   elements.serviceNotice.textContent = ui.service_notice ? ` ${ui.service_notice}` : "";
   renderAnnouncements(status.announcements);
   elements.summary.textContent = available
-    ? (status.login_pending
-      ? "请在浏览器完成笔枢登录"
-      : (status.signed_in
-        ? `已登录${status.account_display_name ? ` · ${status.account_display_name}` : "笔枢账号"}`
-        : `匿名体验 · ${status.models.length} 个可用模型`))
+    ? (status.signed_in
+      ? `已登录${status.account_display_name ? ` · ${status.account_display_name}` : " DeterminFlow 账号"}`
+      : `匿名体验 · ${status.models.length} 个可用模型`)
     : (status.last_error || "暂时无法获取公益模型额度");
   elements.tier.textContent = accessLabel(status);
   const wallet = status.signed_in ? status.account_balance_usd : null;
@@ -248,17 +244,12 @@ function render(status) {
   elements.catalogNote.textContent = `全部 ${status.model_catalog.length} 个 · 当前可用 ${status.models.length} 个；人民币 / 百万 Token，括号内为美元原价`;
   renderCatalog(status.model_catalog);
   elements.renew.textContent = available ? "刷新额度" : "重试";
-  elements.account.textContent = status.login_pending
-    ? "取消登录"
-    : (status.signed_in ? "退出笔枢" : "登录笔枢");
-  elements.account.hidden = !status.signed_in && !status.ui?.login_enabled;
   elements.payment.hidden = !(
     status.signed_in
     && status.ui?.payment_enabled
     && status.ui?.model_page_recharge_enabled
     && status.ui?.payment_url
   );
-  elements.account.disabled = status.state === "disabled" || busy;
   elements.payment.disabled = status.state === "disabled" || busy;
   elements.renew.disabled = status.state === "disabled" || busy;
   const message = status.last_error && available ? status.last_error : "";
@@ -275,8 +266,6 @@ function isSafeOfficialUrl(value) {
 function setBusy(value) {
   busy = value;
   elements.renew.disabled = value || currentStatus?.state === "disabled";
-  elements.account.disabled = value
-    || currentStatus?.state === "disabled";
   elements.payment.disabled = value || currentStatus?.state === "disabled";
 }
 
@@ -304,16 +293,6 @@ elements.renew.addEventListener("click", () => {
   void run(() => request("/renew", { method: "POST" }));
 });
 
-elements.account.addEventListener("click", () => {
-  if (currentStatus?.signed_in || currentStatus?.login_pending) {
-    void run(() => request("/login", { method: "DELETE" }));
-    return;
-  }
-  void run(() => request("/login", { method: "POST" })).then((succeeded) => {
-    if (succeeded) void pollLogin();
-  });
-});
-
 elements.payment.addEventListener("click", () => {
   const url = currentStatus?.ui?.payment_url;
   if (!isSafePaymentUrl(url)) return;
@@ -334,28 +313,8 @@ function isSafePaymentUrl(value) {
   }
 }
 
-async function pollLogin() {
-  if (polling) return;
-  polling = true;
-  try {
-    while (currentStatus?.login_pending) {
-      await new Promise((resolve) => window.setTimeout(resolve, 1000));
-      try {
-        render(await request("/status"));
-      } catch (error) {
-        showError(error);
-        break;
-      }
-    }
-  } finally {
-    polling = false;
-  }
-}
-
-void run(() => request("/status")).then(() => {
-  if (currentStatus?.login_pending) void pollLogin();
-});
+void run(() => request("/status"));
 
 window.setInterval(() => {
-  if (!busy && !polling) void run(() => request("/status"));
+  if (!busy) void run(() => request("/status"));
 }, 60_000);

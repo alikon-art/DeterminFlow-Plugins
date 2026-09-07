@@ -12,11 +12,11 @@ import pytest
 from determinflow_plugin_public_api.backend.catalog import (
     PublicModelCatalogClient,
 )
-from determinflow_plugin_public_api.backend.portal import (
+from determinflow_plugin_public_api.backend.legacy_portal import (
     PortalRequestError,
-    PublicApiPortalClient,
+    LegacyPortalClient as PublicApiPortalClient,
 )
-from determinflow_plugin_public_api.backend.service import PublicApiCredentialService
+from determinflow_plugin_public_api.backend.legacy_service import LegacyCredentialService as PublicApiCredentialService
 
 
 class FakeProviderGateway:
@@ -63,26 +63,15 @@ class FakeBrowserAuthorization:
             "access_token": "access-old",
             "refresh_token": "refresh-old",
         }
-        self.current_tokens: dict[str, str] | None = None
-        self.installation_id = "desktop:core-account"
+        self.installation_ids: list[str] = []
 
-    def access_token(self) -> str | None:
-        return self.current_tokens["access_token"] if self.current_tokens else None
-
-    async def login(self) -> None:
-        self.current_tokens = dict(self.tokens)
-
-    async def logout(self) -> None:
-        self.current_tokens = None
-
-    async def refresh_access_token(self, _stale_access_token: str) -> str | None:
-        if self.current_tokens is None:
-            return None
-        self.current_tokens = {
-            "access_token": "access-new",
-            "refresh_token": "refresh-new",
-        }
-        return self.current_tokens["access_token"]
+    async def authorize(
+        self,
+        _portal: PublicApiPortalClient,
+        installation_id: str,
+    ) -> dict[str, str]:
+        self.installation_ids.append(installation_id)
+        return self.tokens
 
 
 def credential_response(
@@ -229,11 +218,11 @@ def build_service(
             app_version="0.1.0",
             transport=httpx.MockTransport(catalog_handler),
         ),
-            providers=providers,
-            account_session=browser_auth,
-            clock=clock,
-            scheduler_interval_seconds=scheduler_interval_seconds,
-        )
+        providers=providers,
+        clock=clock,
+        scheduler_interval_seconds=scheduler_interval_seconds,
+        browser_auth=browser_auth,
+    )
     return service, providers
 
 
@@ -362,8 +351,15 @@ def test_anonymous_credential_becomes_default_without_duplicate_key_storage(
         assert status.header_status.metadata[1].value == "标准"
         assert status.header_status.metadata[2].value == "08-09 16:00"
         assert status.header_status.metadata[3].value == "08-08 16:00"
-        assert [action.id for action in status.header_status.actions] == ["models"]
+        assert [action.id for action in status.header_status.actions] == [
+            "models",
+            "account",
+        ]
         assert status.header_status.actions[0].kind == "page"
+        assert status.header_status.actions[1].label == "登录笔枢"
+        assert status.header_status.actions[1].kind == "request"
+        assert status.header_status.actions[1].endpoint == "/api/public-api/login"
+        assert status.header_status.actions[1].method == "POST"
         assert status.renewal_due_at == now + timedelta(hours=18)
         assert next(iter(providers.providers)) == "determinflow-public"
         assert providers.providers["determinflow-public"]["api_key"] == "public-key-1"
@@ -605,10 +601,12 @@ def test_failed_anonymous_reissue_after_logout_keeps_header_status_visible(
             clock=lambda: now,
             browser_auth=FakeBrowserAuthorization(),
         )
-        await service.login_account()
+        await service.start_login()
+        assert service._login_task is not None
+        await service._login_task
         assert service.status().signed_in is True
 
-        status = await service.logout_account()
+        status = await service.logout()
 
         assert status.state == "unavailable"
         assert status.signed_in is False
@@ -617,18 +615,30 @@ def test_failed_anonymous_reissue_after_logout_keeps_header_status_visible(
         assert status.header_status.value == "异常"
         assert status.header_status.summary == "更新失败：公益模型服务暂不可用"
         assert [action.id for action in status.header_status.actions] == [
-            "retry",
             "models",
+            "account",
         ]
-        retry_action = status.header_status.actions[0]
-        assert retry_action.label == "重试"
-        assert retry_action.kind == "request"
-        assert retry_action.endpoint == "/api/public-api/renew"
-        assert retry_action.method == "POST"
-        assert status.header_status.actions[1].kind == "page"
+        assert status.header_status.actions[-1].label == "登录笔枢"
         assert "determinflow-public" not in providers.providers
 
     asyncio.run(scenario())
+
+
+def test_logout_transition_keeps_a_pollable_header_status(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 8, 8, tzinfo=UTC)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=credential_response(now))
+
+    service, _providers = build_service(tmp_path, handler, clock=lambda: now)
+    service._logout_in_progress = True
+
+    status = service.status()
+
+    assert status.header_status is not None
+    assert status.header_status.value == "更新中"
+    assert status.header_status.refresh_after_ms == 1000
+    assert status.header_status.metadata[0].value == "正在退出"
 
 
 def test_repeated_login_and_logout_never_hides_header_status(tmp_path: Path) -> None:
@@ -654,49 +664,17 @@ def test_repeated_login_and_logout_never_hides_header_status(tmp_path: Path) -> 
         )
 
         for _ in range(3):
-            await service.login_account()
+            pending = await service.start_login()
+            assert pending.header_status is not None
+            assert service._login_task is not None
+            await service._login_task
             signed_in = service.status()
             assert signed_in.signed_in is True
             assert signed_in.header_status is not None
 
-            anonymous = await service.logout_account()
+            anonymous = await service.logout()
             assert anonymous.signed_in is False
             assert anonymous.header_status is not None
-
-    asyncio.run(scenario())
-
-
-def test_status_refresh_reissues_credential_after_global_account_change(
-    tmp_path: Path,
-) -> None:
-    async def scenario() -> None:
-        now = datetime(2026, 8, 8, 8, tzinfo=UTC)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            access_tier = (
-                "authenticated" if request.headers.get("authorization") else "anonymous"
-            )
-            return httpx.Response(
-                200,
-                json=credential_response(now, access_tier=access_tier),
-            )
-
-        account_session = FakeBrowserAuthorization()
-        service, _providers = build_service(
-            tmp_path,
-            handler,
-            clock=lambda: now,
-            browser_auth=account_session,
-        )
-        anonymous = await service.ensure_credential()
-        assert anonymous.access_tier == "anonymous"
-
-        await account_session.login()
-        authenticated = await service.refresh_client_config(force=True)
-
-        assert authenticated.signed_in is True
-        assert authenticated.access_tier == "authenticated"
-        assert service.state["credential"]["authenticated"] is True
 
     asyncio.run(scenario())
 
@@ -762,7 +740,18 @@ def test_login_refreshes_session_and_issues_seven_day_credential(
             clock=lambda: now,
             browser_auth=browser_auth,
         )
-        await service.login_account()
+        pending = await service.start_login()
+        assert pending.login_pending is True
+        assert pending.header_status is not None
+        assert pending.header_status.value == "登录中"
+        assert pending.header_status.refresh_after_ms == 1000
+        assert [action.label for action in pending.header_status.actions] == [
+            "取消登录"
+        ]
+        assert pending.login_endpoint == "/api/public-api/login"
+        login_task = service._login_task
+        assert login_task is not None
+        await login_task
         status = service.status()
 
         assert status.state == "active"
@@ -789,9 +778,9 @@ def test_login_refreshes_session_and_issues_seven_day_credential(
         assert status.header_status.metadata[1].value == "充值模型组"
         assert status.renewal_due_at == now + timedelta(days=6)
         assert authorizations == ["Bearer access-old", "Bearer access-new"]
-        assert browser_auth.installation_id == "desktop:core-account"
+        assert browser_auth.installation_ids == [service.state["installation_id"]]
         saved = service.state_path.read_text(encoding="utf-8")
-        assert "refresh-new" not in saved
+        assert "refresh-new" in saved
 
     asyncio.run(scenario())
 
@@ -822,7 +811,10 @@ def test_login_accepts_authenticated_credential_when_wallet_is_unavailable(
             browser_auth=FakeBrowserAuthorization(),
         )
         await service.ensure_credential()
-        await service.login_account()
+        await service.start_login()
+        login_task = service._login_task
+        assert login_task is not None
+        await login_task
         status = service.status()
 
         assert status.signed_in is True
@@ -839,7 +831,7 @@ def test_login_accepts_authenticated_credential_when_wallet_is_unavailable(
     asyncio.run(scenario())
 
 
-def test_legacy_session_is_removed_without_losing_credential_metadata(
+def test_status_survives_a_legacy_session_without_account_balance(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -848,27 +840,15 @@ def test_legacy_session_is_removed_without_losing_credential_metadata(
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=credential_response(now))
 
-        state_path = tmp_path / "state.json"
-        tmp_path.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps({
-            "schema_version": 2,
-            "installation_id": "plugin:legacy",
-            "portal_session": {
-                "access_token": "legacy-access",
-                "refresh_token": "legacy-refresh",
-            },
-            "credential": None,
-            "last_attempt_at": None,
-            "last_error": None,
-        }), encoding="utf-8")
         service, _providers = build_service(tmp_path, handler, clock=lambda: now)
         await service.ensure_credential()
+        service.state["portal_session"] = {
+            "access_token": "legacy-access",
+            "refresh_token": "legacy-refresh",
+        }
         status = service.status()
 
-        assert status.signed_in is False
-        assert service.state["schema_version"] == 3
-        assert "portal_session" not in service.state
-        assert "legacy-access" not in state_path.read_text(encoding="utf-8")
+        assert status.signed_in is True
         assert status.account_balance_usd is None
         assert status.header_status is not None
         assert status.header_status.value == "¥0.75"
@@ -918,18 +898,24 @@ def test_backend_ui_capabilities_drive_header_actions(tmp_path: Path) -> None:
                 "official_url": "https://bishuxiezuo.cn/",
             },
         )
-        await service.login_account()
+        await service.start_login()
+        login_task = service._login_task
+        assert login_task is not None
+        await login_task
         status = service.status()
 
         assert status.header_status is not None
         assert [action.id for action in status.header_status.actions] == [
             "models",
             "payment",
+            "account",
         ]
         assert status.header_status.actions[0].kind == "page"
         assert status.header_status.actions[1].href == (
             "https://portal.example.test/public-api/top-up"
         )
+        assert status.header_status.actions[2].label == "退出登录"
+        assert status.header_status.actions[2].method == "DELETE"
 
     asyncio.run(scenario())
 
@@ -970,59 +956,97 @@ def test_header_recharge_switch_does_not_control_model_page_switch(
                 "official_url": "https://bishuxiezuo.cn/",
             },
         )
-        await service.login_account()
+        await service.start_login()
+        assert service._login_task is not None
+        await service._login_task
         status = service.status()
 
         assert status.ui.model_page_recharge_enabled is True
         assert status.ui.header_recharge_enabled is False
         assert status.header_status is not None
-        assert [action.id for action in status.header_status.actions] == ["models"]
+        assert [action.id for action in status.header_status.actions] == [
+            "models",
+            "account",
+        ]
 
     asyncio.run(scenario())
 
 
-def test_login_requires_core_account_service(
+def test_pending_login_can_be_cancelled_without_replacing_anonymous_credential(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         now = datetime(2026, 8, 8, 8, tzinfo=UTC)
 
+        class BlockingBrowserAuthorization:
+            async def authorize(
+                self,
+                _portal: PublicApiPortalClient,
+                _installation_id: str,
+            ) -> dict[str, str]:
+                await asyncio.Future()
+                raise AssertionError("unreachable")
+
         def handler(request: httpx.Request) -> httpx.Response:
             assert request.url.path == "/api/public-api/credentials"
             return httpx.Response(200, json=credential_response(now))
 
-        service, _providers = build_service(tmp_path, handler, clock=lambda: now)
+        service, providers = build_service(
+            tmp_path,
+            handler,
+            clock=lambda: now,
+            browser_auth=BlockingBrowserAuthorization(),
+        )
         await service.ensure_credential()
-        with pytest.raises(PortalRequestError, match="Core 账号服务未启用"):
-            await service.login_account()
+        original_credential = service.state["credential"]
+
+        pending = await service.start_login()
+        assert pending.login_pending is True
+        assert pending.header_status is not None
+        assert pending.header_status.actions[-1].label == "取消登录"
+
+        cancelled = await service.cancel_login()
+
+        assert cancelled.login_pending is False
+        assert cancelled.last_error is None
+        assert cancelled.header_status is not None
+        assert cancelled.header_status.actions[-1].label == "登录笔枢"
+        assert service.state["credential"] == original_credential
+        assert "determinflow-public" in providers.providers
 
     asyncio.run(scenario())
 
 
-def test_core_account_errors_remain_user_safe(tmp_path: Path) -> None:
-    class AccountError(RuntimeError):
-        code = "authorization_denied"
-        message = "账号登录已取消"
-
-    class FailingAccount(FakeBrowserAuthorization):
-        async def login(self) -> None:
-            raise AccountError()
-
+def test_login_is_blocked_when_backend_disables_login(tmp_path: Path) -> None:
     async def scenario() -> None:
         now = datetime(2026, 8, 8, 8, tzinfo=UTC)
 
         def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=credential_response(now))
+            return httpx.Response(
+                200,
+                json=credential_response(now, login_enabled=False),
+            )
 
         service, _providers = build_service(
             tmp_path,
             handler,
             clock=lambda: now,
-            browser_auth=FailingAccount(),
+            client_config={
+                "service_enabled": True,
+                "login_enabled": False,
+                "payment_enabled": False,
+                "header_recharge_enabled": False,
+                "model_page_recharge_enabled": False,
+                "provider_display_name": "笔枢公益模型",
+                "attribution": "由笔枢写作（网页版）免费提供",
+                "service_notice": "仅供体验。",
+                "official_url": "https://bishuxiezuo.cn/",
+            },
         )
-        with pytest.raises(PortalRequestError, match="账号登录已取消") as error:
-            await service.login_account()
-        assert error.value.code == "authorization_denied"
+        await service.ensure_credential()
+
+        with pytest.raises(PortalRequestError, match="登录暂未开放"):
+            await service.start_login()
 
     asyncio.run(scenario())
 
@@ -1032,11 +1056,6 @@ def test_invalid_refresh_falls_back_to_anonymous_without_core_account_state(
 ) -> None:
     async def scenario() -> None:
         now = datetime(2026, 8, 8, 8, tzinfo=UTC)
-
-        class InvalidCoreAccount(FakeBrowserAuthorization):
-            async def refresh_access_token(self, _stale_access_token: str) -> None:
-                self.current_tokens = None
-                return None
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/api/desktop-auth/refresh":
@@ -1051,17 +1070,20 @@ def test_invalid_refresh_falls_back_to_anonymous_without_core_account_state(
             tmp_path,
             handler,
             clock=lambda: now,
-            browser_auth=InvalidCoreAccount(
+            browser_auth=FakeBrowserAuthorization(
                 {"access_token": "expired", "refresh_token": "invalid"}
             ),
         )
-        await service.login_account()
+        await service.start_login()
+        login_task = service._login_task
+        assert login_task is not None
+        await login_task
         status = service.status()
 
         assert status.state == "active"
         assert status.signed_in is False
         assert status.access_tier == "anonymous"
-        assert "portal_session" not in service.state
+        assert service.state["portal_session"] is None
 
     asyncio.run(scenario())
 
@@ -1109,7 +1131,10 @@ def test_restricted_credential_uses_lower_daily_limit_and_anonymous_renewal_wind
                 {"access_token": "access", "refresh_token": "refresh"}
             ),
         )
-        await service.login_account()
+        await service.start_login()
+        login_task = service._login_task
+        assert login_task is not None
+        await login_task
         status = service.status()
 
         assert status.signed_in is True

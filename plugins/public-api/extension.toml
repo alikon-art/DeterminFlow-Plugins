@@ -1,7 +1,7 @@
 [extension]
 id = "public-api"
 name = "笔枢公益模型"
-version = "0.1.33"
+version = "0.1.35"
 api_version = "1"
 description = "由笔枢写作免费提供的模型体验服务。"
 backend = "determinflow_plugin_public_api.backend.extension:create_extension"

@@ -1,4 +1,8 @@
-"""Credential lifecycle owned entirely by the optional public API Plugin."""
+"""Compatibility for released Core clients without the account-session service.
+
+Keep the existing v2 credential store and browser login until Core is upgraded.
+New Core clients never instantiate this service.
+"""
 
 from __future__ import annotations
 
@@ -9,9 +13,10 @@ import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, NoReturn, Protocol
+from typing import Any
 from uuid import uuid4
 
+from .browser_auth import BrowserAuthorizationFlow
 from .catalog import CatalogRequestError, PublicModelCatalogClient
 from .models import (
     HeaderStatus,
@@ -22,12 +27,14 @@ from .models import (
     PublicApiQuota,
     PublicApiStatus,
 )
-from .portal import PortalRequestError, PublicApiPortalClient, is_allowed_service_url
+from .portal import PortalRequestError, is_allowed_service_url
+from .legacy_portal import LegacyPortalClient as PublicApiPortalClient
+from .service import PublicApiCredentialService as CurrentCredentialService
 from .provider import ProviderGateway, ProviderRequestError
 
 logger = logging.getLogger(__name__)
 
-_STATE_SCHEMA_VERSION = 3
+_STATE_SCHEMA_VERSION = 2
 _SCHEDULER_INTERVAL_SECONDS = 15 * 60
 _QUOTA_STALE_AFTER = timedelta(minutes=20)
 _ANONYMOUS_RENEWAL_LEAD = timedelta(hours=6)
@@ -35,20 +42,7 @@ _AUTHENTICATED_RENEWAL_LEAD = timedelta(days=1)
 _BEIJING_TIME = timezone(timedelta(hours=8))
 
 
-class CoreAccountSession(Protocol):
-    @property
-    def installation_id(self) -> str: ...
-
-    def access_token(self) -> str | None: ...
-
-    async def refresh_access_token(self, stale_access_token: str) -> str | None: ...
-
-    async def login(self) -> dict[str, Any]: ...
-
-    async def logout(self) -> dict[str, Any]: ...
-
-
-class PublicApiCredentialService:
+class LegacyCredentialService:
     """Manage one ordinary Provider credential for an installed Plugin."""
 
     def __init__(
@@ -61,9 +55,9 @@ class PublicApiCredentialService:
         catalog: PublicModelCatalogClient,
         providers: ProviderGateway,
         disabled_reason: str | None = None,
-        account_session: CoreAccountSession | None = None,
         clock: Callable[[], datetime] | None = None,
         scheduler_interval_seconds: float = _SCHEDULER_INTERVAL_SECONDS,
+        browser_auth: BrowserAuthorizationFlow | None = None,
     ) -> None:
         self.data_dir = data_dir.expanduser().resolve()
         self.app_version = app_version.strip() or "unknown"
@@ -72,12 +66,14 @@ class PublicApiCredentialService:
         self.catalog = catalog
         self.providers = providers
         self.disabled_reason = disabled_reason
-        self.account_session = account_session
         self.state_path = self.data_dir / "state.json"
         self._clock = clock or (lambda: datetime.now(UTC))
         self._scheduler_interval_seconds = scheduler_interval_seconds
         self._lock = asyncio.Lock()
         self._scheduler_task: asyncio.Task[None] | None = None
+        self._login_task: asyncio.Task[None] | None = None
+        self._logout_in_progress = False
+        self._browser_auth = browser_auth or BrowserAuthorizationFlow()
         self._runtime_ui: PublicApiClientUI | None = None
         self._runtime_announcements: list[PublicApiAnnouncement] = []
         self._runtime_ui_fetched_at: datetime | None = None
@@ -87,6 +83,7 @@ class PublicApiCredentialService:
         return {
             "schema_version": _STATE_SCHEMA_VERSION,
             "installation_id": f"plugin:{uuid4()}",
+            "portal_session": None,
             "credential": None,
             "last_attempt_at": None,
             "last_error": self.disabled_reason,
@@ -99,10 +96,6 @@ class PublicApiCredentialService:
             return state
         try:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
-            if isinstance(state, dict) and state.get("schema_version") == 2:
-                state.pop("portal_session", None)
-                state["schema_version"] = _STATE_SCHEMA_VERSION
-                self._save_state(state)
             if (
                 not isinstance(state, dict)
                 or state.get("schema_version") != _STATE_SCHEMA_VERSION
@@ -144,6 +137,10 @@ class PublicApiCredentialService:
             )
 
     async def stop(self) -> None:
+        if self._login_task is not None:
+            self._login_task.cancel()
+            await asyncio.gather(self._login_task, return_exceptions=True)
+            self._login_task = None
         if self._scheduler_task is None:
             return
         self._scheduler_task.cancel()
@@ -153,7 +150,7 @@ class PublicApiCredentialService:
     async def _scheduler_loop(self) -> None:
         while True:
             await asyncio.sleep(self._scheduler_interval_seconds)
-            if self._credential() is None and not self._account_signed_in():
+            if self._credential() is None and self._session() is None:
                 continue
             try:
                 await self.ensure_credential(force=True)
@@ -162,7 +159,7 @@ class PublicApiCredentialService:
 
     def status(self) -> PublicApiStatus:
         credential = self._credential()
-        signed_in = self._account_signed_in()
+        signed_in = self._session() is not None
         expires_at = self._parse_datetime(
             credential.get("expires_at") if credential else None
         )
@@ -200,7 +197,7 @@ class PublicApiCredentialService:
         response = PublicApiStatus(
             state=state_name,
             signed_in=signed_in,
-            login_pending=False,
+            login_pending=self._login_task is not None and not self._login_task.done(),
             access_tier=credential.get("access_tier") if credential else None,
             balance_tier=balance_tier,
             provider_id=credential.get("provider_id") if credential else None,
@@ -226,11 +223,6 @@ class PublicApiCredentialService:
 
     async def refresh_client_config(self, *, force: bool = False) -> PublicApiStatus:
         await self._bootstrap_runtime(force=force, renew_credential=False)
-        credential = self._credential()
-        if credential is not None and bool(credential.get("authenticated")) != (
-            self._account_signed_in()
-        ):
-            return await self.ensure_credential(force=True)
         return self.status()
 
     async def _bootstrap_runtime(
@@ -268,7 +260,7 @@ class PublicApiCredentialService:
         elif (
             renew_credential
             and (self._runtime_ui is None or self._runtime_ui.service_enabled)
-            and (self._credential() is not None or self._account_signed_in())
+            and (self._credential() is not None or self._session() is not None)
         ):
             follow_ups.append(asyncio.create_task(self.ensure_credential(force=True)))
         results = await asyncio.gather(*follow_ups, return_exceptions=True)
@@ -367,47 +359,113 @@ class PublicApiCredentialService:
         return self.status()
 
     async def login_account(self) -> PublicApiStatus:
-        if self.account_session is None:
-            raise PortalRequestError("service_unavailable", "Core 账号服务未启用")
-        try:
-            await self.account_session.login()
-        except Exception as exc:
-            self._raise_account_error(exc)
-        return await self.ensure_credential(force=True)
+        return await self.start_login()
 
     async def logout_account(self) -> PublicApiStatus:
-        if self.account_session is None:
-            raise PortalRequestError("service_unavailable", "Core 账号服务未启用")
+        if self.status().login_pending:
+            return await self.cancel_login()
+        return await self.logout()
+
+    async def start_login(self) -> PublicApiStatus:
+        if self.portal is None:
+            raise PortalRequestError("service_unavailable", "公益模型服务未启用")
+        if self._runtime_ui is None:
+            await self.refresh_client_config()
+        if not self._client_ui(self._credential()).login_enabled:
+            raise PortalRequestError("service_unavailable", "公益模型登录暂未开放")
+        if self._login_task is not None and not self._login_task.done():
+            return self.status()
+        self.state["last_error"] = None
+        self._save_state()
+        self._login_task = asyncio.create_task(
+            self._complete_browser_login(),
+            name="public-api-plugin-browser-login",
+        )
+        return self.status()
+
+    async def _complete_browser_login(self) -> None:
+        assert self.portal is not None
+        previous_session = self.state.get("portal_session")
         try:
-            await self.account_session.logout()
-        except Exception as exc:
-            self._raise_account_error(exc)
+            tokens = await self._browser_auth.authorize(
+                self.portal,
+                self.state["installation_id"],
+            )
+            async with self._lock:
+                self.state["portal_session"] = tokens
+                self.state["last_error"] = None
+                self._save_state()
+                await self._ensure_locked(force=True)
+                credential = self._credential()
+                if not (
+                    self._session() is not None
+                    and credential is not None
+                    and credential.get("authenticated") is True
+                ):
+                    message = self.state.get("last_error")
+                    if isinstance(message, str):
+                        raise PortalRequestError("login_failed", message)
+        except asyncio.CancelledError:
+            raise
+        except PortalRequestError as exc:
+            async with self._lock:
+                self.state["portal_session"] = previous_session
+                self.state["last_error"] = exc.message
+                self._save_state()
+        finally:
+            self._login_task = None
+
+    async def cancel_login(self) -> PublicApiStatus:
+        login_task = self._login_task
+        if login_task is None or login_task.done():
+            return self.status()
+        login_task.cancel()
+        await asyncio.gather(login_task, return_exceptions=True)
+        self._login_task = None
+        self.state["last_error"] = None
+        self._save_state()
+        return self.status()
+
+    async def logout(self) -> PublicApiStatus:
+        if self.portal is None:
+            raise PortalRequestError("service_unavailable", "公益模型服务未启用")
         async with self._lock:
-            credential = self._credential()
-            if credential:
-                try:
-                    await self._remove_managed_provider(credential)
-                except ProviderRequestError:
-                    logger.warning("退出 Core 账号时无法移除公益模型 Provider")
-            self.state["credential"] = None
-            self.state["last_error"] = None
-            self._save_state()
-            return await self._ensure_locked(force=True)
+            self._logout_in_progress = True
+            try:
+                session = self._session()
+                if session:
+                    try:
+                        await self.portal.logout(session["refresh_token"])
+                    except PortalRequestError:
+                        logger.info("笔枢远端退出失败，继续清除本地登录状态")
+                credential = self._credential()
+                if credential:
+                    try:
+                        await self._remove_managed_provider(credential)
+                    except ProviderRequestError:
+                        logger.warning("退出时无法移除公益模型 Provider")
+                self.state["portal_session"] = None
+                self.state["credential"] = None
+                self.state["last_error"] = None
+                self._save_state()
+                await self._ensure_locked(force=True)
+            finally:
+                self._logout_in_progress = False
+        return self.status()
 
     async def _request_and_apply(
         self,
         credential: dict[str, Any] | None,
     ) -> None:
         assert self.portal is not None
-        access_token = self._account_access_token()
-        signed_in = access_token is not None
+        session = self._session()
         credential_id = self._renewable_credential_id(
             credential,
-            signed_in,
+            session is not None,
         )
         payload = {
             "request_id": f"plugin:{uuid4()}",
-            "installation_id": self._installation_id(),
+            "installation_id": self.state["installation_id"],
             "app_version": self.app_version,
             "release_channel": self.release_channel,
             "platform": "windows",
@@ -415,23 +473,28 @@ class PublicApiCredentialService:
         if credential_id:
             payload["credential_id"] = credential_id
 
+        access_token = session["access_token"] if session else None
         try:
             response = await self.portal.issue(payload, access_token=access_token)
         except PortalRequestError as exc:
-            if exc.code != "authentication_failed" or access_token is None:
+            if exc.code != "authentication_failed" or session is None:
                 raise
             try:
-                refreshed = await self.account_session.refresh_access_token(access_token)
-            except Exception as account_error:
-                self._raise_account_error(account_error)
-            if refreshed is None:
+                tokens = await self.portal.refresh(session["refresh_token"])
+            except PortalRequestError as refresh_error:
+                if refresh_error.code != "authentication_failed":
+                    raise
+                self.state["portal_session"] = None
+                self._save_state()
                 payload.pop("credential_id", None)
                 response = await self.portal.issue(payload, access_token=None)
-                signed_in = False
+                session = None
             else:
+                self.state["portal_session"] = tokens
+                self._save_state()
                 response = await self.portal.issue(
                     payload,
-                    access_token=refreshed,
+                    access_token=tokens["access_token"],
                 )
 
         parsed = self._validate_credential_response(response)
@@ -448,7 +511,7 @@ class PublicApiCredentialService:
         await self.providers.apply(parsed)
         if previous and previous.get("provider_id") != parsed["provider_id"]:
             await self._remove_managed_provider(previous)
-        parsed["authenticated"] = signed_in
+        parsed["authenticated"] = session is not None
         parsed["issued_at"] = self._clock().isoformat()
         parsed.pop("api_key")
         self.state["credential"] = parsed
@@ -539,33 +602,85 @@ class PublicApiCredentialService:
         }
 
     def _header_status(self, status: PublicApiStatus) -> HeaderStatus | None:
-        if status.state == "unavailable":
+        header = self._legacy_header_status(status)
+        if header is not None:
+            return header
+        if status.state == "unavailable" and not status.login_pending:
+            header = CurrentCredentialService._header_status(self, status)
+            if header and status.ui.login_enabled:
+                header.actions.append(HeaderStatusAction(
+                    id="login", label="登录笔枢", kind="request",
+                    endpoint="/api/public-api/login", method="POST",
+                ))
+            return header
+        return None
+
+    def _legacy_header_status(self, status: PublicApiStatus) -> HeaderStatus | None:
+        if status.login_pending and status.quota is None and status.ui.login_enabled:
+            now = self._clock()
+            return HeaderStatus(
+                visible=True,
+                label="公益",
+                value="登录中",
+                title="公益模型账号登录",
+                summary="请在浏览器完成登录",
+                summary_href=status.ui.official_url,
+                tone="normal",
+                metrics=[],
+                metadata=[HeaderStatusMetric(label="身份", value="等待登录")],
+                actions=[
+                    HeaderStatusAction(
+                        id="account",
+                        label="取消登录",
+                        kind="request",
+                        endpoint="/api/public-api/login",
+                        method="DELETE",
+                    )
+                ],
+                refresh_after_ms=1000,
+                updated_at=now,
+            )
+        if status.quota is None and self._logout_in_progress:
+            now = self._clock()
+            return HeaderStatus(
+                visible=True,
+                label="公益",
+                value="更新中",
+                title="公益模型账号切换",
+                summary="正在切换为匿名体验",
+                tone="normal",
+                metrics=[],
+                metadata=[HeaderStatusMetric(label="身份", value="正在退出")],
+                actions=[],
+                refresh_after_ms=1000,
+                updated_at=now,
+            )
+        if status.state == "unavailable" and status.last_error:
             now = self._clock()
             actions: list[HeaderStatusAction] = [
-                HeaderStatusAction(
-                    id="retry" if status.last_error else "enable",
-                    label="重试" if status.last_error else "启用公益模型",
-                    kind="request",
-                    endpoint="/api/public-api/renew",
-                    method="POST",
-                ),
                 HeaderStatusAction(
                     id="models",
                     label="模型列表",
                     kind="page",
                 )
             ]
+            if status.ui.login_enabled:
+                actions.append(
+                    HeaderStatusAction(
+                        id="account",
+                        label="退出登录" if status.signed_in else "登录笔枢",
+                        kind="request",
+                        endpoint="/api/public-api/login",
+                        method="DELETE" if status.signed_in else "POST",
+                    )
+                )
             return HeaderStatus(
                 visible=True,
                 label="公益",
-                value="异常" if status.last_error else "未启用",
-                title="公益模型更新异常" if status.last_error else "公益模型未启用",
-                summary=(
-                    f"更新失败：{status.last_error}"
-                    if status.last_error
-                    else "启用后可查看并使用公益模型额度。"
-                ),
-                tone="critical" if status.last_error else "attention",
+                value="异常",
+                title="公益模型更新异常",
+                summary=f"更新失败：{status.last_error}",
+                tone="critical",
                 metrics=[],
                 metadata=[
                     HeaderStatusMetric(
@@ -616,6 +731,23 @@ class PublicApiCredentialService:
                     href=status.ui.payment_url,
                 )
             )
+        if status.ui.login_enabled:
+            actions.append(
+                HeaderStatusAction(
+                    id="account",
+                    label=(
+                        "取消登录"
+                        if status.login_pending
+                        else ("退出登录" if status.signed_in else "登录笔枢")
+                    ),
+                    kind="request",
+                    endpoint="/api/public-api/login",
+                    method="DELETE"
+                    if status.signed_in or status.login_pending
+                    else "POST",
+                )
+            )
+
         metrics: list[HeaderStatusMetric]
         if is_account:
             metrics = [
@@ -695,16 +827,20 @@ class PublicApiCredentialService:
             value=self._money(amount),
             title="公益模型额度",
             summary=(
-                f"更新失败：{status.last_error}"
-                if status.last_error
-                else status.ui.attribution
+                "请在浏览器完成登录"
+                if status.login_pending
+                else (
+                    f"更新失败：{status.last_error}"
+                    if status.last_error
+                    else status.ui.attribution
+                )
             ),
             summary_href=status.ui.official_url,
             tone=tone,
             metrics=metrics,
             metadata=metadata,
             actions=actions,
-            refresh_after_ms=None,
+            refresh_after_ms=1000 if status.login_pending else None,
             updated_at=measured_at,
         )
 
@@ -803,29 +939,17 @@ class PublicApiCredentialService:
         value = self.state.get("credential")
         return value if isinstance(value, dict) else None
 
-    def _account_access_token(self) -> str | None:
-        if self.account_session is None:
+    def _session(self) -> dict[str, str] | None:
+        value = self.state.get("portal_session")
+        if not isinstance(value, dict):
             return None
-        value = self.account_session.access_token()
-        return value if isinstance(value, str) and value else None
-
-    def _account_signed_in(self) -> bool:
-        return self._account_access_token() is not None
-
-    def _installation_id(self) -> str:
-        if self.account_session is not None:
-            value = self.account_session.installation_id
-            if isinstance(value, str) and value:
-                return value
-        return str(self.state["installation_id"])
-
-    @staticmethod
-    def _raise_account_error(exc: Exception) -> NoReturn:
-        code = getattr(exc, "code", None)
-        message = getattr(exc, "message", None)
-        if isinstance(code, str) and isinstance(message, str):
-            raise PortalRequestError(code, message) from exc
-        raise exc
+        access_token = value.get("access_token")
+        refresh_token = value.get("refresh_token")
+        if not isinstance(access_token, str) or not isinstance(refresh_token, str):
+            return None
+        if not access_token or not refresh_token:
+            return None
+        return {"access_token": access_token, "refresh_token": refresh_token}
 
     @staticmethod
     def _parse_datetime(value: Any) -> datetime | None:
